@@ -84,7 +84,7 @@ def _render_cli_reference() -> str:
         "| `skill-scanner configure-policy` | Interactive TUI policy editor | `skill-scanner configure-policy` |",
         "| `skill-scanner interactive` | Interactive setup wizard | `skill-scanner interactive` |",
         "| `skill-scanner-api` | Start the REST API server | `skill-scanner-api --port 8080` |",
-        "| `skill-scanner-pre-commit` | Git pre-commit hook | `skill-scanner-pre-commit install` |",
+        "| `skill-scanner-pre-commit` | Git pre-commit hook | `skill-scanner-pre-commit --install` |",
         "",
         "## Common Flags",
         "",
