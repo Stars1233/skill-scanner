@@ -24,9 +24,19 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .dataflow.forward_analysis import ForwardDataflowAnalysis
 from .parser.python_parser import FunctionInfo, PythonParser
+
+
+def _domain_matches(hostname: str, domain: str, *, allow_label: bool = False) -> bool:
+    """Return whether *hostname* is *domain* or one of its subdomains."""
+    hostname = hostname.rstrip(".").lower()
+    domain = domain.rstrip(".").lower()
+    if "." not in domain:
+        return hostname == domain or (allow_label and domain in hostname.split("."))
+    return hostname == domain or hostname.endswith(f".{domain}")
 
 
 @dataclass
@@ -185,9 +195,15 @@ class ContextExtractor:
         "webhook.site",
         "requestbin",
         "ngrok.io",
+        "ngrok-free.dev",
+        "ngrok-free.app",
+        "ngrok.app",
         "pipedream.net",
         "localhost.run",
         "trycloudflare.com",
+        "bore.pub",
+        "serveo.net",
+        "localtunnel.me",
         # Code execution services (LOTS: C&C, Download)
         "codepen.io",
         "repl.co",
@@ -352,17 +368,24 @@ class ContextExtractor:
         suspicious_urls = []
         for s in all_strings:
             # Skip if not URL-like or contains newlines (docstrings)
-            if "\n" in s or not s.startswith("http"):
+            if "\n" in s:
                 continue
             # Skip if too long (likely docstring) or too short
             if len(s) > 200 or len(s) < 10:
                 continue
-            # Skip if contains legitimate domain
-            if any(domain in s for domain in self.LEGITIMATE_DOMAINS):
+            try:
+                parsed = urlsplit(s)
+                if parsed.scheme.lower() not in {"http", "https"}:
+                    continue
+                hostname = parsed.hostname or ""
+            except ValueError:
                 continue
-            # ONLY flag if URL contains a known suspicious domain
+            # Skip if the parsed host is a legitimate domain.
+            if any(_domain_matches(hostname, domain) for domain in self.LEGITIMATE_DOMAINS):
+                continue
+            # ONLY flag if the parsed host is a known suspicious domain.
             # Don't flag all unknown URLs - that's too aggressive
-            if any(domain in s for domain in self.SUSPICIOUS_DOMAINS):
+            if any(_domain_matches(hostname, domain, allow_label=True) for domain in self.SUSPICIOUS_DOMAINS):
                 suspicious_urls.append(s)
 
         # Create context
