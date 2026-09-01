@@ -24,6 +24,7 @@ import hashlib
 import logging
 import pickletools
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -82,6 +83,19 @@ _GLOB_PATTERNS = [
     re.compile(r"\.rglob\("),
     re.compile(r"fnmatch\."),
 ]
+_SENSITIVE_PATH_LITERAL_RE = re.compile(
+    r"(?i)(?:\.aws[/\\]credentials|\.ssh[/\\](?:id_[a-z0-9_]+|authorized_keys)|"
+    r"\.(?:npmrc|gitconfig|gnupg|netrc|pgpass)|(?:^|[/\\])credentials?(?:[/\\]|$)|"
+    r"(?:^|[/\\])secrets?(?:[/\\]|$))"
+)
+_OBFUSCATED_INSTRUCTION_RE = re.compile(
+    r"(?is)(?:"
+    r"ignore\s+(?:all\s+)?(?:previous|prior|earlier)\s+instructions?"
+    r"|you\s+are\s+now\s+in\s+(?:developer|debug|unrestricted|admin)\s+mode"
+    r"|(?:read|collect|capture|harvest|exfiltrate).{0,160}(?:credentials?|tokens?|api\s*keys?|ssh|environment|dotfiles?)"
+    r"|(?:post|send|transmit|exfiltrate).{0,160}https?://"
+    r")"
+)
 
 _COMMENT_LINE_RE = re.compile(r"^\s*(?:#|//|/\*|\*|<!--)")
 _NEGATED_EXFILTRATION_RE = re.compile(
@@ -481,6 +495,7 @@ class StaticAnalyzer(BaseAnalyzer):
         findings.extend(self._check_manifest(skill))
         findings.extend(self._scan_instruction_body(skill))
         findings.extend(self._scan_scripts(skill))
+        findings.extend(self._check_dynamic_sensitive_file_access(skill))
         findings.extend(self._check_consistency(skill))
         findings.extend(self._check_dependency_pinning(skill))
         findings.extend(self._scan_config_files(skill))
@@ -488,6 +503,7 @@ class StaticAnalyzer(BaseAnalyzer):
         findings.extend(self._check_binary_files(skill))
         findings.extend(self._check_hidden_files(skill))
         findings.extend(self._check_ascii_smuggling(skill))
+        findings.extend(self._check_unicode_obfuscated_instructions(skill))
         findings.extend(self._check_file_inventory(skill))
         findings.extend(self._check_pdf_documents(skill))
         findings.extend(self._check_office_documents(skill))
@@ -769,6 +785,103 @@ class StaticAnalyzer(BaseAnalyzer):
                     analyzer="static",
                 )
             )
+
+        return findings
+
+    @staticmethod
+    def _attribute_path(node: ast.AST) -> str | None:
+        """Return a dotted attribute path for a simple AST expression."""
+        parts: list[str] = []
+        current = node
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+            return ".".join(reversed(parts))
+        return None
+
+    def _check_dynamic_sensitive_file_access(self, skill: Skill) -> list[Finding]:
+        """Detect glob/open flows that enumerate credential files indirectly.
+
+        Regex signatures cannot connect a sensitive path literal in an
+        ``os.path.join`` list to a later ``glob.glob(pattern)`` or ``open(path)``.
+        This conservative AST check only reports a file when the same lexical scope
+        contains both a credential-like path literal and a glob operation.
+        """
+        findings: list[Finding] = []
+
+        for sf in skill.get_scripts():
+            if sf.file_type != "python":
+                continue
+            content = sf.read_content()
+            try:
+                tree = ast.parse(content, filename=sf.relative_path)
+            except (SyntaxError, ValueError):
+                continue
+
+            def _owned_nodes(scope: ast.AST) -> list[ast.AST]:
+                """Return nodes owned by one scope, excluding nested scopes."""
+                owned: list[ast.AST] = []
+                stack = list(ast.iter_child_nodes(scope))
+                while stack:
+                    node = stack.pop()
+                    owned.append(node)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                        continue
+                    stack.extend(ast.iter_child_nodes(node))
+                return owned
+
+            scope_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+            scopes: list[ast.AST] = [tree, *(node for node in ast.walk(tree) if isinstance(node, scope_types))]
+            for scope in scopes:
+                scope_nodes = _owned_nodes(scope)
+                has_sensitive_literal = any(
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and _SENSITIVE_PATH_LITERAL_RE.search(node.value)
+                    for node in scope_nodes
+                )
+                if not has_sensitive_literal:
+                    continue
+
+                for node in scope_nodes:
+                    if not isinstance(node, ast.Call):
+                        continue
+                    call_path = self._attribute_path(node.func)
+                    attribute_name = node.func.attr if isinstance(node.func, ast.Attribute) else None
+                    is_glob_call = call_path in {
+                        "glob.glob",
+                        "glob.iglob",
+                        "pathlib.Path.glob",
+                        "pathlib.Path.rglob",
+                        "Path.glob",
+                        "Path.rglob",
+                    } or attribute_name in {"glob", "iglob", "rglob"}
+                    if not is_glob_call:
+                        continue
+                    line = getattr(node, "lineno", 1)
+                    findings.append(
+                        Finding(
+                            id=self._generate_finding_id("DATA_EXFIL_SENSITIVE_FILES", f"{sf.relative_path}:{line}"),
+                            rule_id="DATA_EXFIL_SENSITIVE_FILES",
+                            category=ThreatCategory.DATA_EXFILTRATION,
+                            severity=Severity.HIGH,
+                            title="Dynamic enumeration of sensitive files",
+                            description=(
+                                f"{sf.relative_path}:{line} enumerates files with a glob operation in a scope "
+                                "that also constructs credential-like paths. Dynamic path construction can hide "
+                                "credential harvesting from literal-pattern checks."
+                            ),
+                            file_path=sf.relative_path,
+                            line_number=line,
+                            snippet=ast.get_source_segment(content, node),
+                            remediation="Do not enumerate credential or configuration files from a skill; use explicit, non-sensitive inputs.",
+                            analyzer="static",
+                            metadata={"detection_method": "ast_sensitive_path_and_glob"},
+                        )
+                    )
+                    break
 
         return findings
 
@@ -1775,6 +1888,188 @@ class StaticAnalyzer(BaseAnalyzer):
 
         return findings
 
+    @staticmethod
+    def _socket_target_is_local(node: ast.AST | None) -> bool:
+        """Return whether a socket call target is explicitly local-only."""
+        if isinstance(node, (ast.Tuple, ast.List)) and node.elts:
+            node = node.elts[0]
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value.strip().lower().rstrip(".") in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+        if isinstance(node, ast.Call):
+            return not node.args and StaticAnalyzer._attribute_path(node.func) == "socket.gethostname"
+
+        return False
+
+    def _socket_call_can_contact_remote(self, node: ast.Call) -> bool:
+        """Classify one supported socket call using its own target argument."""
+        call_path = self._attribute_path(node.func)
+        if (
+            call_path is None
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "connect"
+            and isinstance(node.func.value, ast.Call)
+            and self._attribute_path(node.func.value.func) == "socket.socket"
+        ):
+            call_path = "socket.socket.connect"
+
+        target_apis = {
+            "socket.connect",
+            "socket.socket.connect",
+            "socket.create_connection",
+            "socket.getaddrinfo",
+            "socket.gethostbyname",
+            "socket.gethostbyname_ex",
+            "socket.getnameinfo",
+            "socket.getfqdn",
+        }
+        if call_path not in target_apis:
+            return False
+
+        # getfqdn() without an argument resolves the current host only.
+        if call_path == "socket.getfqdn" and not node.args:
+            return False
+
+        target = node.args[0] if node.args else None
+        return not self._socket_target_is_local(target)
+
+    def _content_uses_external_socket_api(self, content: str) -> bool:
+        """Return whether any individual socket call can contact a remote host."""
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError):
+            # Preserve conservative detection for malformed or partial Python.
+            return bool(
+                re.search(
+                    r"socket\.(?:connect|create_connection|getaddrinfo|gethostbyname(?:_ex)?|getnameinfo|getfqdn)\s*\(",
+                    content,
+                )
+                or re.search(r"socket\.socket\s*\([^)]*\)\.connect\s*\(", content)
+            )
+
+        return any(self._socket_call_can_contact_remote(node) for node in ast.walk(tree) if isinstance(node, ast.Call))
+
+    @staticmethod
+    def _decode_obfuscated_unicode(text: str) -> tuple[str, set[str]]:
+        """Decode common Unicode instruction-obfuscation representations."""
+        try:
+            from confusable_homoglyphs import confusables  # type: ignore[import-untyped]
+        except ImportError:
+            confusables = None
+
+        normalized = unicodedata.normalize("NFKC", text)
+        decoded: list[str] = []
+        encodings: set[str] = set()
+        for char in normalized:
+            codepoint = ord(char)
+            replacement: str | None = None
+
+            # Variation Selectors Supplement encoding used by the reported PoC.
+            if 0xE0100 <= codepoint <= 0xE017E:
+                value = codepoint - 0xE0100
+                if value == 10 or 0x20 <= value <= 0x7E:
+                    replacement = chr(value)
+                    encodings.add("variation-selectors-supplement")
+
+            # A Braille offset encoding is not a Braille document: printable
+            # ASCII shifted into U+2800–U+28FF is a strong steganography signal.
+            elif 0x2800 <= codepoint <= 0x28FF:
+                value = codepoint - 0x2800
+                if value == 10 or 0x20 <= value <= 0x7E:
+                    replacement = chr(value)
+                    encodings.add("braille-offset")
+
+            # Map non-Latin confusables back to an ASCII lookalike when the
+            # optional Unicode Consortium data is available.
+            elif confusables is not None and not char.isascii():
+                info = confusables.is_confusable(char, preferred_aliases=["LATIN"])
+                if info:
+                    for entry in info:
+                        for glyph in entry.get("homoglyphs", []):
+                            candidate = glyph.get("c", "")
+                            if len(candidate) == 1 and candidate.isascii() and candidate.isalnum():
+                                replacement = candidate
+                                encodings.add("unicode-confusable")
+                                break
+                        if replacement is not None:
+                            break
+
+            if replacement is not None:
+                decoded.append(replacement)
+            else:
+                decoded.append(char)
+
+        result = "".join(decoded)
+        if result != text and not encodings:
+            encodings.add("unicode-normalization")
+        return result, encodings
+
+    def _check_unicode_obfuscated_instructions(self, skill: Skill) -> list[Finding]:
+        """Detect high-signal prompt injections hidden behind Unicode variants.
+
+        Detection runs over a normalized/decoded view so visually disguised text
+        cannot evade ordinary instruction signatures. This is intentionally not
+        a blanket ban on non-ASCII text; a transformed payload must also contain
+        explicit instruction or data-theft language.
+        """
+        findings: list[Finding] = []
+        for sf in skill.files:
+            if sf.content is None or sf.file_type not in {"markdown", "python", "bash"}:
+                continue
+            content = sf.content
+            decoded, encodings = self._decode_obfuscated_unicode(content)
+            if not encodings or decoded == content:
+                continue
+
+            # Require repeated encoded characters for offset encodings. A lone
+            # Braille character can be legitimate; a supplementary variation
+            # selector is itself an invisible format signal.
+            encoded_counts = {
+                "variation-selectors-supplement": sum(0xE0100 <= ord(ch) <= 0xE017E for ch in content),
+                "braille-offset": sum(0x2800 <= ord(ch) <= 0x28FF for ch in content),
+                "unicode-confusable": sum(not ch.isascii() for ch in content),
+                "unicode-normalization": sum(unicodedata.normalize("NFKC", ch) != ch for ch in content),
+            }
+            if encoded_counts["braille-offset"] < 8 and "braille-offset" in encodings:
+                encodings.discard("braille-offset")
+            if encoded_counts["unicode-confusable"] < 3 and "unicode-confusable" in encodings:
+                encodings.discard("unicode-confusable")
+            if encoded_counts["unicode-normalization"] < 3 and "unicode-normalization" in encodings:
+                encodings.discard("unicode-normalization")
+            if not encodings or not _OBFUSCATED_INSTRUCTION_RE.search(decoded):
+                continue
+
+            first_line = next(
+                (
+                    line_no
+                    for line_no, line in enumerate(content.splitlines(), 1)
+                    if any(not ch.isascii() for ch in line)
+                ),
+                1,
+            )
+            preview = " ".join(decoded.split())[:160]
+            findings.append(
+                Finding(
+                    id=self._generate_finding_id("UNICODE_OBFUSCATED_INSTRUCTION", sf.relative_path),
+                    rule_id="UNICODE_OBFUSCATED_INSTRUCTION",
+                    category=ThreatCategory.PROMPT_INJECTION,
+                    severity=Severity.HIGH,
+                    title="Obfuscated prompt-injection instructions detected",
+                    description=(
+                        f"Unicode-obfuscated instructions were detected in {sf.relative_path} using "
+                        f"{', '.join(sorted(encodings))}. Recovered text includes a high-risk instruction or "
+                        f"data-access pattern: {preview}"
+                    ),
+                    file_path=sf.relative_path,
+                    line_number=first_line,
+                    remediation="Remove the obfuscated Unicode content and review the skill for prompt-injection and data-exfiltration behavior.",
+                    analyzer="static",
+                    metadata={"encodings": sorted(encodings), "decoded_preview": preview},
+                )
+            )
+        return findings
+
     def _skill_uses_network(self, skill: Skill) -> bool:
         """Check if skill code uses network libraries for EXTERNAL communication."""
         external_network_indicators = [
@@ -1787,21 +2082,14 @@ class StaticAnalyzer(BaseAnalyzer):
             "import aiohttp",
         ]
 
-        socket_external_indicators = ["socket.connect", "socket.create_connection"]
-        socket_localhost_indicators = ["localhost", "127.0.0.1", "::1"]
-
         for skill_file in skill.get_scripts():
             content = skill_file.read_content()
 
             if any(indicator in content for indicator in external_network_indicators):
                 return True
 
-            if "import socket" in content:
-                has_socket_connect = any(ind in content for ind in socket_external_indicators)
-                is_localhost_only = any(ind in content for ind in socket_localhost_indicators)
-
-                if has_socket_connect and not is_localhost_only:
-                    return True
+            if "import socket" in content and self._content_uses_external_socket_api(content):
+                return True
 
         return False
 
@@ -2017,13 +2305,13 @@ class StaticAnalyzer(BaseAnalyzer):
             "http.client",
             "httpx.",
             "aiohttp.",
-            "socket.connect",
-            "socket.create_connection",
         ]
 
         for skill_file in skill.get_scripts():
             content = skill_file.read_content()
-            if any(indicator in content for indicator in network_indicators):
+            if any(indicator in content for indicator in network_indicators) or self._content_uses_external_socket_api(
+                content
+            ):
                 return True
         return False
 
